@@ -43,7 +43,9 @@ func newBrowser() *Browser {
 // can fail over past an address they cannot reach.
 func (b *Browser) setRelay(nodes []noderec.DirectoryNode) {
 	m := make(map[string]discovery.Node, len(nodes))
+	verified := make(map[string]bool, len(nodes))
 	for _, n := range nodes {
+		proved := n.IdentityVerification == noderec.IdentityLocal || n.IdentityVerification == noderec.IdentityPinned
 		svc, ok := n.Services[noderec.ServiceCluster]
 		if !ok {
 			continue
@@ -55,12 +57,22 @@ func (b *Browser) setRelay(nodes []noderec.DirectoryNode) {
 		if len(hosts) == 0 {
 			continue
 		}
-		m[n.HostUUID] = discovery.Node{
+		node := discovery.Node{
 			ID:        n.Name,
 			Addresses: hosts,
 			Port:      svc.Port,
 			TXT:       append([]string{"uuid=" + n.HostUUID}, n.AddressTXT()...),
 		}
+		// A selected discovery remains addressable for pairing, independently
+		// of the preferred endpoint for an already verified host.
+		if n.DiscoveryRecordID != "" {
+			m[n.DiscoveryRecordID] = node
+		}
+		if verified[n.HostUUID] && !proved {
+			continue
+		}
+		m[n.HostUUID] = node
+		verified[n.HostUUID] = proved
 	}
 	b.mu.Lock()
 	b.relay = m
@@ -73,6 +85,12 @@ func (b *Browser) setRelay(nodes []noderec.DirectoryNode) {
 // ranking is evidence from its vantage point, not a promise about this host's.
 func (b *Browser) Resolve(idOrUUID string) (hosts []string, port int, ok bool) {
 	b.mu.RLock()
+	if node, present := b.relay[idOrUUID]; present && node.Port > 0 {
+		if addresses := pickHosts(node); len(addresses) > 0 {
+			b.mu.RUnlock()
+			return addresses, node.Port, true
+		}
+	}
 	nodes := make([]discovery.Node, 0, len(b.relay))
 	for _, n := range b.relay {
 		nodes = append(nodes, n)
