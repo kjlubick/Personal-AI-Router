@@ -23,7 +23,7 @@ import (
 	"nvpair-shared/noderec"
 )
 
-// Browser holds the relay-fed peer map, keyed by the directory hostUuid.
+// Browser resolves relay records by discovery record ID and host UUID.
 type Browser struct {
 	mu    sync.RWMutex
 	relay map[string]discovery.Node
@@ -33,14 +33,11 @@ func newBrowser() *Browser {
 	return &Browser{relay: make(map[string]discovery.Node)}
 }
 
-// setRelay replaces the resolver map from a discovery:nodes snapshot: every node
-// advertising cl with an IP becomes a resolvable entry keyed by hostUuid (the
-// rest are dropped). The broker sends the full filtered set on every change, so
-// this is a wholesale replace, not a per-node apply — a departed node is simply
-// absent from the next snapshot and stops resolving. The synthesized TXT carries
-// uuid=<hostUuid> so Resolve's UUID match works (hostUuid is the same principal
-// the node advertises as uuid=), plus the node's own address ranking so callers
-// can fail over past an address they cannot reach.
+// setRelay replaces the resolver map from a discovery:nodes snapshot. Records
+// with a cluster service and dialable addresses remain selectable by record ID
+// for pairing. Verified records take precedence when resolving a host UUID.
+// Departed records disappear with the next snapshot. Synthesized TXT preserves
+// the host UUID and address ranking for callers that need address failover.
 func (b *Browser) setRelay(nodes []noderec.DirectoryNode) {
 	m := make(map[string]discovery.Node, len(nodes))
 	verified := make(map[string]bool, len(nodes))
@@ -79,10 +76,10 @@ func (b *Browser) setRelay(nodes []noderec.DirectoryNode) {
 	b.mu.Unlock()
 }
 
-// Resolve returns a node's addresses in the order it ranked them, plus its
-// cluster-manager port, for a UUID or nodeId (hostname); a UUID match wins. The
-// list is what a caller dials down until one address answers — the publisher's
-// ranking is evidence from its vantage point, not a promise about this host's.
+// Resolve returns ranked addresses and the cluster-manager port. Exact record
+// ID and host UUID lookups take precedence over hostname matching. Callers try
+// the addresses in order because the publisher's ranking does not establish
+// which addresses this host can reach.
 func (b *Browser) Resolve(idOrUUID string) (hosts []string, port int, ok bool) {
 	b.mu.RLock()
 	if node, present := b.relay[idOrUUID]; present && node.Port > 0 {

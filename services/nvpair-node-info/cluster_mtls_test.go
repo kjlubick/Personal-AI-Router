@@ -32,9 +32,11 @@ import (
 func genLeaf(t *testing.T, uuid string) (certPEM, keyPEM []byte) {
 	t.Helper()
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
-	require.NoError(t, err, "genkey")
-	serial, _ := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
-	uri, _ := url.Parse("urn:nvpair:node:" + uuid)
+	require.NoError(t, err)
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	require.NoError(t, err)
+	uri, err := url.Parse("urn:nvpair:node:" + uuid)
+	require.NoError(t, err)
 	tmpl := &x509.Certificate{
 		SerialNumber:          serial,
 		Subject:               pkix.Name{CommonName: uuid},
@@ -47,7 +49,8 @@ func genLeaf(t *testing.T, uuid string) (certPEM, keyPEM []byte) {
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, pub, priv)
 	require.NoError(t, err, "create cert")
-	keyDER, _ := x509.MarshalPKCS8PrivateKey(priv)
+	keyDER, err := x509.MarshalPKCS8PrivateKey(priv)
+	require.NoError(t, err)
 	certPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 	keyPEM = pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
 	return certPEM, keyPEM
@@ -62,8 +65,13 @@ func setupNode(t *testing.T, certPEM, keyPEM []byte, pins map[string][]byte) str
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "node.key"), keyPEM, 0o600))
 	td := filepath.Join(dir, "trusted")
 	require.NoError(t, os.MkdirAll(td, 0o700))
+	type peerPin struct {
+		NodeUUID string `json:"nodeUuid"`
+		CertPEM  string `json:"certPem"`
+	}
 	for uuid, pcert := range pins {
-		body, _ := json.Marshal(map[string]string{"nodeUuid": uuid, "certPem": string(pcert)})
+		body, err := json.Marshal(peerPin{NodeUUID: uuid, CertPEM: string(pcert)})
+		require.NoError(t, err)
 		require.NoError(t, os.WriteFile(filepath.Join(td, uuid+".json"), body, 0o600))
 	}
 	return dir
