@@ -73,9 +73,18 @@ func LoadIdentity(clusterDir string) (*Identity, error) {
 // these on pairing; consumers Reload() to pick up newly-paired (or removed)
 // peers without a restart.
 type Trust struct {
-	dir  string
-	mu   sync.RWMutex
-	ders map[string][]byte
+	dir        string
+	mu         sync.RWMutex
+	ders       map[string][]byte
+	recordKeys map[string]string
+}
+
+type peerPinRecord struct {
+	NodeUUID       string `json:"nodeUuid"`
+	CertPem        string `json:"certPem"`
+	ClusterID      string `json:"clusterId"`
+	AdmissionEpoch uint64 `json:"admissionEpoch"`
+	PinnedAt       int64  `json:"pinnedAt"`
 }
 
 // newTrust opens clusterDir/trusted. The pins are read by the owning Mesh's
@@ -108,6 +117,7 @@ func (t *Trust) Reload() {
 	// A missing dir leaves entries nil, so the loop below is a no-op and the
 	// empty set is published — the authoritative "no peers trusted".
 	ders := make(map[string][]byte, len(entries))
+	recordKeys := make(map[string]string, len(entries))
 	for _, e := range entries {
 		name := e.Name()
 		if e.IsDir() || !strings.HasSuffix(name, ".json") || strings.HasSuffix(name, ".tmp") {
@@ -123,13 +133,11 @@ func (t *Trust) Reload() {
 			// a revocation. A pin we have never read stays absent.
 			if previous, ok := t.DER(fileUUID); ok {
 				ders[fileUUID] = previous
+				recordKeys[fileUUID] = t.recordKey(fileUUID)
 			}
 			continue
 		}
-		var pin struct {
-			NodeUUID string `json:"nodeUuid"`
-			CertPem  string `json:"certPem"`
-		}
+		var pin peerPinRecord
 		// A pin that reads but does not parse or does not validate is dropped,
 		// not carried: that is a content problem, and honoring a certificate we
 		// can no longer verify the provenance of is the one failure this store
@@ -142,10 +150,18 @@ func (t *Trust) Reload() {
 			continue
 		}
 		ders[fileUUID] = der
+		recordKeys[fileUUID] = fmt.Sprintf("%s:%d:%d", pin.ClusterID, pin.AdmissionEpoch, pin.PinnedAt)
 	}
 	t.mu.Lock()
 	t.ders = ders
+	t.recordKeys = recordKeys
 	t.mu.Unlock()
+}
+
+func (t *Trust) recordKey(uuid string) string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.recordKeys[uuid]
 }
 
 // pinDER validates that a pin file's inner nodeUuid, filename, and embedded
