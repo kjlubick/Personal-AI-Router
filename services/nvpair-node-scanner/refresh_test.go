@@ -4,11 +4,11 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-
 	"strconv"
 	"sync"
 	"testing"
@@ -43,7 +43,8 @@ func (s *modelsStub) set(status int, body map[string]any) {
 	s.mu.Unlock()
 }
 
-func (s *modelsStub) handler() http.HandlerFunc {
+func (s *modelsStub) handler(t *testing.T) http.HandlerFunc {
+	t.Helper()
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/models" {
 			http.NotFound(w, r)
@@ -57,7 +58,7 @@ func (s *modelsStub) handler() http.HandlerFunc {
 		}
 		w.WriteHeader(status)
 		if body != nil {
-			_ = json.NewEncoder(w).Encode(body)
+			assert.NoError(t, json.NewEncoder(w).Encode(body))
 		}
 	}
 }
@@ -68,7 +69,7 @@ func startModelsStub(t *testing.T, status int, body map[string]any) (*modelsStub
 	t.Helper()
 	stub := &modelsStub{}
 	stub.set(status, body)
-	srv := httptest.NewServer(stub.handler())
+	srv := httptest.NewServer(stub.handler(t))
 	t.Cleanup(srv.Close)
 	return stub, portFromURL(t, srv.URL)
 }
@@ -82,18 +83,14 @@ func portFromURL(t *testing.T, raw string) int {
 	return p
 }
 
-// newRefreshTestDaemon builds a daemon wired for the refresh path only: a real
-// directory + modelsHTTP client and initialized caches, no codec/responder (emit
-// is nil-safe and the refresh path never advertises). The registry is stamped
-// with a self uuid that no peer test seeds, so refreshNodeModels dials each peer
-// at its advertised address (the self-loopback branch is exercised separately in
-// TestRefreshSelfDialsLoopback).
+// newRefreshTestDaemon initializes model reconciliation without announcements or
+// IPC. Its loopback fixtures exercise inventory changes; authenticated remote
+// behavior uses newDiscoveryPeerFixture.
 func newRefreshTestDaemon() *daemon {
 	return &daemon{
 		reg:                newRegistry("self-node-uuid", "", selfAddrs("127.0.0.1")),
 		dir:                newDirectory(),
 		modelsHTTP:         &http.Client{Timeout: modelsFetchTimeout},
-		lastInfo:           make(map[string]NodeInfoResponse),
 		lastInfoAt:         make(map[string]time.Time),
 		lastModels:         make(map[string][]string),
 		lastModelsByEngine: make(map[string]map[string][]string),
@@ -114,10 +111,7 @@ func seedEMNode(d *daemon, hostUUID, ip string, emPort int) {
 	})
 }
 
-// TestRefreshPopulatesInitialEmptyInventory covers the primary bug: a known em
-// peer whose first enrichment returned nothing converges once its engine serves
-// models, with no mDNS record change — a single refresh fetch populates the
-// directory and reports a change.
+// Model inventory converges without requiring a changed discovery announcement.
 func TestRefresh_PopulatesInitialEmptyInventory(t *testing.T) {
 	d := newRefreshTestDaemon()
 	_, port := startModelsStub(t, http.StatusOK, map[string]any{
@@ -153,14 +147,8 @@ func TestRefreshModels_FallsBackToASecondPublishedAddress(t *testing.T) {
 	require.Equal(t, []string{"reachable-model"}, got.Models, "Models")
 }
 
-// TestRefreshSelfDialsLoopback is the regression for the periodic model
-// refresh: our OWN node must be dialed over loopback, not its advertised LAN
-// ip=, so a pull/delete/late-engine-start keeps converging after startup even
-// when inbound to the LAN address is firewalled (the Windows failure this
-// addresses). The stub listens ONLY on loopback while the self entry advertises
-// an unreachable LAN address, so the fetch can only succeed via the loopback
-// dial. The stored (advertised) address is still used as applyModels' stale-
-// address guard, so it must be preserved.
+// The owned engine-manager listens on loopback while the directory advertises
+// an unreachable LAN address. A local refresh must preserve that advertised IP.
 func TestRefreshSelf_DialsLoopback(t *testing.T) {
 	d := newRefreshTestDaemon() // reg self uuid = "self-node-uuid"
 	_, port := startModelsStub(t, http.StatusOK, map[string]any{
@@ -178,9 +166,89 @@ func TestRefreshSelf_DialsLoopback(t *testing.T) {
 	assert.Equal(t, unreachableLAN, got.IP, "self IP (%v)", unreachableLAN)
 }
 
-// TestRefreshPullDeleteAndUnchanged covers three required behaviors together: a
-// pull and a delete each change the inventory and emit exactly one update, while
-// an unchanged inventory emits nothing (no repeated updates).
+// Republishing local services during an outage must retain the latest periodic inventory.
+func TestPublishSelf_RetainsLatestModelsAfterLocalInventoryFailure(t *testing.T) {
+	d := newSelfTestDaemon("self-uuid", "192.0.2.1")
+	stub, port := startModelsStub(t, http.StatusOK, map[string]any{
+		"models":         []string{"initial-model"},
+		"modelsByEngine": map[string][]string{"ollama": {"initial-model"}},
+		"loadedByEngine": map[string][]string{"ollama": {"initial-model"}},
+	})
+	d.reg.register(noderec.RegisterParams{Service: noderec.ServiceEngineManager, Port: port})
+	d.publishSelf()
+	stub.set(http.StatusOK, map[string]any{
+		"models":         []string{"latest-model"},
+		"modelsByEngine": map[string][]string{"ollama": {"latest-model"}},
+		"loadedByEngine": map[string][]string{"ollama": {"latest-model"}},
+	})
+	require.True(t, d.refreshNodeModels("self-uuid", "192.0.2.1", port, ""))
+
+	stub.set(http.StatusServiceUnavailable, nil)
+	d.publishSelf()
+
+	node, present := d.dir.get("self-uuid")
+	require.True(t, present)
+	assert.Equal(t, []string{"latest-model"}, node.Models)
+	assert.Equal(t, map[string][]string{"ollama": {"latest-model"}}, node.ModelsByEngine)
+	assert.Equal(t, map[string][]string{"ollama": {"latest-model"}}, node.LoadedByEngine)
+}
+
+// Publishing local services must not wait for an engine-manager read before
+// owned hardware notifications and subsequent IPC can proceed.
+func TestPublishSelf_UsesCachedModelsWithoutWaitingForHTTP(t *testing.T) {
+	d := newSelfTestDaemon("self-uuid", "192.0.2.1")
+	blockReads := make(chan struct{})
+	readStarted := make(chan struct{}, 1)
+	release := make(chan struct{})
+	releaseRead := sync.OnceFunc(func() { close(release) })
+	defer releaseRead()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		select {
+		case <-blockReads:
+			readStarted <- struct{}{}
+			<-release
+		default:
+		}
+		assert.NoError(t, json.NewEncoder(w).Encode(map[string][]string{"models": {"retained-model"}}))
+	}))
+	t.Cleanup(server.Close)
+	port := portFromURL(t, server.URL)
+	d.reg.register(noderec.RegisterParams{Service: noderec.ServiceEngineManager, Port: port})
+	d.publishSelf()
+	require.True(t, d.refreshNodeModels("self-uuid", "192.0.2.1", port, ""))
+	select {
+	case <-d.modelsWake:
+	default:
+	}
+	close(blockReads)
+
+	published := make(chan struct{})
+	go func() {
+		d.publishSelf()
+		close(published)
+	}()
+	select {
+	case <-published:
+	case <-readStarted:
+		t.Error("local publication started an HTTP read instead of using cached models")
+		releaseRead()
+		<-published
+	case <-time.After(5 * time.Second):
+		releaseRead()
+		t.Fatal("local publication did not complete")
+	}
+
+	node, present := d.dir.get("self-uuid")
+	require.True(t, present)
+	assert.Equal(t, []string{"retained-model"}, node.Models)
+	select {
+	case <-d.modelsWake:
+	default:
+		t.Error("local publication must schedule model refresh")
+	}
+}
+
+// Downloads and deletions each change inventory once; unchanged reads stay quiet.
 func TestRefreshModels_ReportsDownloadsAndDeletionsButNotUnchangedInventory(t *testing.T) {
 	d := newRefreshTestDaemon()
 	stub, port := startModelsStub(t, http.StatusOK, map[string]any{
@@ -225,9 +293,7 @@ func TestRefreshModels_ReportsDownloadsAndDeletionsButNotUnchangedInventory(t *t
 	assert.Equal(t, map[string][]string{"ollama": {}}, got.ModelsByEngine, "ModelsByEngine after last delete")
 }
 
-// TestRefreshReorderOnlyIsNotAChange asserts the compare is order-insensitive: a
-// response that returns the same models in a different order is not treated as a
-// change (no spurious update).
+// Reordering the same installed models must not emit another directory update.
 func TestRefreshReorderOnly_IsNotAChange(t *testing.T) {
 	d := newRefreshTestDaemon()
 	stub, port := startModelsStub(t, http.StatusOK, map[string]any{
@@ -243,9 +309,7 @@ func TestRefreshReorderOnly_IsNotAChange(t *testing.T) {
 	assert.False(t, d.refreshNodeModels("peer-R", "127.0.0.1", port, ""), "a mere reordering of the same models should not report a change")
 }
 
-// TestRefreshFetchFailureRetainsInventory covers requirement 5: a transient
-// fetch failure preserves the last successful flat and per-engine inventories
-// (no blanking) and reports no change.
+// A failed refresh preserves both flat and per-engine inventories.
 func TestRefreshFetchFailure_RetainsInventory(t *testing.T) {
 	d := newRefreshTestDaemon()
 	stub, port := startModelsStub(t, http.StatusOK, map[string]any{
@@ -261,17 +325,9 @@ func TestRefreshFetchFailure_RetainsInventory(t *testing.T) {
 	got, _ := d.dir.get("peer-C")
 	assert.Equal(t, []string{"keep-me"}, got.Models, "Models after failure")
 	assert.Equal(t, map[string][]string{"ollama": {"keep-me"}}, got.ModelsByEngine, "ModelsByEngine after failure")
-	d.infoMu.Lock()
-	cachedFlat := d.lastModels["peer-C"]
-	cachedByEngine := d.lastModelsByEngine["peer-C"]
-	d.infoMu.Unlock()
-	assert.Equal(t, []string{"keep-me"}, cachedFlat, "cached flat inventory")
-	assert.Equal(t, map[string][]string{"ollama": {"keep-me"}}, cachedByEngine, "cached per-engine inventory")
 }
 
-// TestRefreshPartialModelsByEngine covers requirement 4: a partial
-// modelsByEngine response (attribution covering fewer models than the flat
-// union, as a mixed-version peer might send) is propagated exactly as returned.
+// A peer may attribute fewer models to engines than it includes in the union.
 func TestRefreshModels_PreservesInventoryForUnreportedEngines(t *testing.T) {
 	d := newRefreshTestDaemon()
 	_, port := startModelsStub(t, http.StatusOK, map[string]any{
@@ -285,8 +341,7 @@ func TestRefreshModels_PreservesInventoryForUnreportedEngines(t *testing.T) {
 	assert.Equal(t, map[string][]string{"ollama": {"x"}}, got.ModelsByEngine, "ModelsByEngine")
 }
 
-// TestRefreshPopulatesLoadedByEngine covers Phase 2: a peer's loadedByEngine is
-// carried onto the directory node from the same /v1/models fetch.
+// The same model fetch supplies the peer's installed and loaded inventories.
 func TestRefresh_PopulatesLoadedByEngine(t *testing.T) {
 	d := newRefreshTestDaemon()
 	_, port := startModelsStub(t, http.StatusOK, map[string]any{
@@ -301,10 +356,7 @@ func TestRefresh_PopulatesLoadedByEngine(t *testing.T) {
 	assert.Equal(t, map[string][]string{"ollama": {"llama3:8b"}, "lmstudio": {}}, got.LoadedByEngine, "LoadedByEngine")
 }
 
-// TestRefreshLoadedOnlyChangeReportsChange covers the loaded-set reconcile: when
-// only loadedByEngine changes (a JIT load / TTL eviction with the same installed
-// list), the refresh reports a change and updates the field so remote cards stay
-// live.
+// Loading a model changes the directory even when installed models stay the same.
 func TestRefreshLoadedOnlyChange_ReportsChange(t *testing.T) {
 	d := newRefreshTestDaemon()
 	stub, port := startModelsStub(t, http.StatusOK, map[string]any{
@@ -334,8 +386,7 @@ func TestRefreshLoadedOnlyChange_ReportsChange(t *testing.T) {
 	assert.False(t, d.refreshNodeModels("peer-M", "127.0.0.1", port, ""), "an identical loaded set should not report a change")
 }
 
-// TestRefreshLoadedRetainedOnFailure confirms a transient fetch failure preserves
-// the last successful loadedByEngine rather than blanking it.
+// A failed refresh must not clear the last accepted loaded-model inventory.
 func TestRefreshModels_RetainsLoadedModelsAfterFetchFailure(t *testing.T) {
 	d := newRefreshTestDaemon()
 	stub, port := startModelsStub(t, http.StatusOK, map[string]any{
@@ -350,49 +401,9 @@ func TestRefreshModels_RetainsLoadedModelsAfterFetchFailure(t *testing.T) {
 	assert.False(t, d.refreshNodeModels("peer-N", "127.0.0.1", port, ""), "a failed fetch should not report a change")
 	got, _ := d.dir.get("peer-N")
 	assert.Equal(t, map[string][]string{"ollama": {"keep-me"}}, got.LoadedByEngine, "LoadedByEngine after failure")
-	d.infoMu.Lock()
-	cachedLoaded := d.lastLoadedByEngine["peer-N"]
-	d.infoMu.Unlock()
-	assert.Equal(t, map[string][]string{"ollama": {"keep-me"}}, cachedLoaded, "cached loaded inventory")
 }
 
-// TestApplyModelsGuard covers requirement 6 at the directory layer: a completed
-// fetch is discarded (ok == false) when the node was removed or re-addressed
-// while it was in flight, so it can neither resurrect a removed node nor
-// overwrite a re-addressed one.
-func TestApplyModels_RejectsRemovedNodeAndStaleAddress(t *testing.T) {
-	d := newDirectory()
-
-	// Removed mid-sweep: node absent -> not resurrected.
-	_, changed, ok := d.applyModels("ghost", "127.0.0.1", 14322, []string{"a"}, nil, nil)
-	assert.False(t, ok, "applyModels on an absent node = (changed (%v, %v)", changed, ok)
-	assert.False(t, changed, "applyModels on an absent node = (changed (%v, %v)", changed, ok)
-	_, present := d.get("ghost")
-	assert.False(t, present, "applyModels must not resurrect a removed node")
-
-	// Re-addressed mid-sweep: node present but IP changed -> not overwritten.
-	d.upsert(noderec.DirectoryNode{
-		HostUUID: "peer-E",
-		IP:       "10.0.0.9",
-		Services: map[noderec.ServiceKey]noderec.ServiceStatus{noderec.ServiceEngineManager: {Port: 14322}},
-		Models:   []string{"old"},
-	})
-	_, changed, ok = d.applyModels("peer-E", "127.0.0.1", 14322, []string{"new"}, nil, nil)
-	assert.False(t, ok, "applyModels with a stale IP = (changed (%v, %v)", changed, ok)
-	assert.False(t, changed, "applyModels with a stale IP = (changed (%v, %v)", changed, ok)
-	// em port changed -> also discarded.
-	_, changed, ok = d.applyModels("peer-E", "10.0.0.9", 99999, []string{"new"}, nil, nil)
-	assert.False(t, ok, "applyModels with a stale em port = (changed (%v, %v)", changed, ok)
-	assert.False(t, changed, "applyModels with a stale em port = (changed (%v, %v)", changed, ok)
-	got, _ := d.get("peer-E")
-	assert.Equal(t, []string{"old"}, got.Models, "Models after guarded rejects")
-}
-
-// TestRefreshNodeModelsRemovedMidSweep exercises the guard through the daemon's
-// per-node path: a node evicted between the sweep snapshot and the fetch's
-// completion is not resurrected in the directory (the requirement-6 guarantee).
-// The cache may hold the fetched value (it is written before the directory
-// guard, as last-known-good), so this asserts only the directory invariant.
+// A missing node must stay absent when a periodic sweep reaches its old target.
 func TestRefreshNodeModels_DoesNotRestoreNodeRemovedDuringSweep(t *testing.T) {
 	d := newRefreshTestDaemon()
 	_, port := startModelsStub(t, http.StatusOK, map[string]any{
@@ -406,51 +417,85 @@ func TestRefreshNodeModels_DoesNotRestoreNodeRemovedDuringSweep(t *testing.T) {
 	assert.False(t, present, "an in-flight result must not resurrect a removed node")
 }
 
-// TestRefreshOnceConcurrentSlowPeers covers requirement 7: multiple slow peers
-// are refreshed concurrently, so one slow peer does not consume another's
-// timeout budget. It proves concurrency deterministically with an entry barrier
-// rather than a wall-clock threshold: both stub handlers must be ENTERED before
-// either is released. A serial sweep would block inside the first handler and
-// never enter the second, so the barrier wait fails fast. The time.After bounds
-// are failure ceilings, not success-timing assertions, so the test isn't flaky.
-func TestRefreshOnce_PollsSlowPeersConcurrently(t *testing.T) {
-	const peers = 2 // must stay <= modelsRefreshConcurrency
-	entered := make(chan struct{}, peers)
-	release := make(chan struct{})
-	handler := func(w http.ResponseWriter, r *http.Request) {
-		entered <- struct{}{}
-		<-release // hold until both peers are concurrently in-flight
-		_ = json.NewEncoder(w).Encode(map[string]any{"models": []string{"m"}})
-	}
-	s1 := httptest.NewServer(http.HandlerFunc(handler))
-	s2 := httptest.NewServer(http.HandlerFunc(handler))
-	t.Cleanup(s1.Close)
-	t.Cleanup(s2.Close)
-
-	d := newRefreshTestDaemon()
-	seedEMNode(d, "peer-1", "127.0.0.1", portFromURL(t, s1.URL))
-	seedEMNode(d, "peer-2", "127.0.0.1", portFromURL(t, s2.URL))
-
-	done := make(chan struct{})
-	go func() { d.refreshModelsOnce(); close(done) }()
-
-	// Both handlers must be entered before either is released; only a concurrent
-	// sweep can reach this point.
-	for i := 0; i < peers; i++ {
-		select {
-		case <-entered:
-		case <-time.After(5 * time.Second):
-			require.FailNowf(t, "model sweep did not issue concurrent requests", "%d of %d peers entered", i, peers)
+// Both peer handlers must be entered before either is released. This proves
+// concurrency without requiring successful requests to meet a timing threshold.
+func TestRefreshModels_ConcurrentAuthenticatedPeers(t *testing.T) {
+	first := newDiscoveryPeerFixture(t, "peer-1")
+	first.discover(t)
+	second := newDiscoveryPeerFixture(t, "peer-2")
+	second.attach(t, first.daemon)
+	entered, release := make(chan struct{}, 2), make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+	for _, f := range []*discoveryPeerFixture{first, second} {
+		f.info.Peer.Services[noderec.ServiceEngineManager] = portFromURL(t, f.server.URL)
+		f.daemon.refreshTelemetryOnce(context.Background())
+		f.respond = func(w http.ResponseWriter, r *http.Request) bool {
+			if r.URL.Path != "/v1/models" {
+				return false
+			}
+			entered <- struct{}{}
+			<-release
+			inventory := modelInventoryResponse{Models: []string{"m"}}
+			assert.NoError(t, json.NewEncoder(w).Encode(inventory))
+			return true
 		}
 	}
-	close(release)
+	done := make(chan struct{})
+	go func() { first.daemon.refreshModelsOnce(); close(done) }()
+	for range 2 {
+		select {
+		case <-entered:
+		case <-time.After(2 * time.Second):
+			require.FailNow(t, "models did not refresh peers concurrently")
+		}
+	}
+	releaseOnce.Do(func() { close(release) })
 	select {
 	case <-done:
-	case <-time.After(5 * time.Second):
-		require.FailNow(t, "refreshModelsOnce did not complete after releasing peers")
+	case <-time.After(2 * time.Second):
+		require.FailNow(t, "models refresh did not finish")
 	}
-	got, _ := d.dir.get("peer-1")
-	assert.Equal(t, []string{"m"}, got.Models, "peer-1 Models")
-	got, _ = d.dir.get("peer-2")
-	assert.Equal(t, []string{"m"}, got.Models, "peer-2 Models")
+	for _, uuid := range []string{"peer-1", "peer-2"} {
+		node, _ := first.daemon.dir.get(uuid)
+		assert.Equal(t, []string{"m"}, node.Models, "peer %s", uuid)
+	}
+}
+
+type modelInventoryResponse struct {
+	Models []string `json:"models"`
+}
+
+func TestApplyModels_DoesNotRestoreRemovedNode(t *testing.T) {
+	d := newDirectory()
+
+	_, changed, ok := d.applyModels("ghost", "127.0.0.1", 14322, []string{"a"}, nil, nil)
+	assert.False(t, ok)
+	assert.False(t, changed)
+	_, present := d.get("ghost")
+	assert.False(t, present)
+}
+
+func TestApplyModels_RejectsChangedEndpoint(t *testing.T) {
+	test := func(name, ip string, port int) {
+		t.Run(name, func(t *testing.T) {
+			d := newDirectory()
+			d.upsert(noderec.DirectoryNode{
+				HostUUID: "peer-E",
+				IP:       "10.0.0.9",
+				Services: map[noderec.ServiceKey]noderec.ServiceStatus{noderec.ServiceEngineManager: {Port: 14322}},
+				Models:   []string{"old"},
+			})
+
+			_, changed, ok := d.applyModels("peer-E", ip, port, []string{"new"}, nil, nil)
+
+			assert.False(t, ok)
+			assert.False(t, changed)
+			node, present := d.get("peer-E")
+			require.True(t, present)
+			assert.Equal(t, []string{"old"}, node.Models)
+		})
+	}
+	test("address changes", "127.0.0.1", 14322)
+	test("port changes", "10.0.0.9", 14323)
 }

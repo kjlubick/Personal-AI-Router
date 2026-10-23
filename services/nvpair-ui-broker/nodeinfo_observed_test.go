@@ -55,7 +55,7 @@ func TestForwardNodeInfoObservedAddresses_ReachesTheScanner(t *testing.T) {
 				_ = codec.Respond(msg.ID, map[string]bool{"ok": true})
 			}()
 
-			b.forwardNodeInfoNotification(noderec.NotifyObservedAddresses, json.RawMessage(tc.from))
+			b.nodeInfoNotificationHandler(0)(noderec.NotifyObservedAddresses, json.RawMessage(tc.from))
 
 			select {
 			case msg := <-relayed:
