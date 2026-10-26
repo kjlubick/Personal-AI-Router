@@ -152,8 +152,8 @@ func (e *Executor) LaunchSettings(engine string) (settings.LaunchState, error) {
 	if err != nil {
 		return settings.LaunchState{}, err
 	}
-	st.opMu.Lock()
-	defer st.opMu.Unlock()
+	st.lockOperation()
+	defer st.unlockOperation()
 	return e.launchStateLocked(engine, st), nil
 }
 
@@ -207,8 +207,8 @@ func (e *Executor) RejectRemoteCORSChange(request settings.Request) error {
 		// the relay refuses the unknown engine on its own.
 		return nil
 	}
-	st.opMu.Lock()
-	defer st.opMu.Unlock()
+	st.lockOperation()
+	defer st.unlockOperation()
 	return e.rejectRemoteCORSChangeLocked(st, request)
 }
 
@@ -233,8 +233,8 @@ func (e *Executor) PreviewLaunch(p settings.Request) (settings.Preview, error) {
 	if err != nil {
 		return settings.Preview{}, err
 	}
-	st.opMu.Lock()
-	defer st.opMu.Unlock()
+	st.lockOperation()
+	defer st.unlockOperation()
 	if p.PreserveCORS {
 		if err := e.rejectRemoteCORSChangeLocked(st, p); err != nil {
 			return settings.Preview{}, err
@@ -396,8 +396,8 @@ func (e *Executor) ConfigureLaunch(ctx context.Context, p settings.Configure, re
 	if err != nil {
 		return settings.LaunchState{}, err
 	}
-	st.opMu.Lock()
-	defer st.opMu.Unlock()
+	st.lockOperation()
+	defer st.unlockOperation()
 	if err := ctx.Err(); err != nil {
 		return settings.LaunchState{}, err
 	}

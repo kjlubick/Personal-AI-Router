@@ -70,6 +70,13 @@ func (e *Executor) Models(ctx context.Context) []string {
 // dropped its models for peers. Concurrency bounds the sweep by the slowest
 // single engine, not the sum.
 func (e *Executor) ModelsResult(ctx context.Context) ModelsResult {
+	res, _ := e.modelsResult(ctx)
+	return res
+}
+
+// modelsResult also reports a canceled sweep to HTTP callers, which must not
+// replace a peer's last-good inventory with a successful partial response.
+func (e *Executor) modelsResult(ctx context.Context) (ModelsResult, error) {
 	ctx, cancel := context.WithTimeout(ctx, modelsTimeout)
 	defer cancel()
 
@@ -80,6 +87,7 @@ func (e *Executor) ModelsResult(ctx context.Context) ModelsResult {
 	listOK := make([]bool, len(engineNames))
 	loaded := make([][]string, len(engineNames))
 	loadedOK := make([]bool, len(engineNames))
+	statusErrs := make([]error, len(engineNames))
 	var wg sync.WaitGroup
 	for i, name := range engineNames {
 		mf, ok := e.reg.Get(name)
@@ -99,8 +107,12 @@ func (e *Executor) ModelsResult(ctx context.Context) ModelsResult {
 		wg.Add(1)
 		go func(i int, name string, listSpec, loadedSpec *ActionResult) {
 			defer wg.Done()
-			st, err := e.Status(name)
-			if err != nil || !st.Running {
+			st, err := e.statusWithContext(ctx, name, 0, true)
+			if err != nil {
+				statusErrs[i] = err
+				return
+			}
+			if !st.Running {
 				return
 			}
 			if listSpec != nil {
@@ -163,7 +175,15 @@ func (e *Executor) ModelsResult(ctx context.Context) ModelsResult {
 			res.LoadedByEngine[engineNames[i]] = ld
 		}
 	}
-	return res
+	if err := ctx.Err(); err != nil {
+		return res, err
+	}
+	for _, err := range statusErrs {
+		if err != nil {
+			return res, err
+		}
+	}
+	return res, nil
 }
 
 // extractStrings is the value-only wrapper used by focused extractor tests.

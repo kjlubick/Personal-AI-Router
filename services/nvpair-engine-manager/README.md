@@ -78,6 +78,10 @@ Requests (caller → service):
 | `shutdown` | — | `null` |
 | `log/set-level` | `{ level }` | `{ level }` |
 
+The `/v1/models` HTTP surface returns 503 if its five-second sweep expires,
+allowing a peer to keep its last-good inventory. Individual engine query
+failures still omit that engine from an otherwise successful result.
+
 `EngineStatus` = `{ engine, display_name, installed, running, healthy, port }`.
 
 Notifications (service → caller): `engine:ready{version}`,
@@ -231,6 +235,14 @@ would only collide on the port. Consequences worth knowing:
   following `start:true` then adopts the running instance.
 - **Liveness reconciliation uses the same probe.** A fixed-port engine found
   already serving is reported `running: true` even though NVPAIR never started it.
+
+Passive `engine:status` and `engine:get-installed` probes run outside the engine's
+lifecycle operation lock. Concurrent readers of the same engine and port share
+one bounded probe, and a result is applied only if no lifecycle or health state
+change intervened. During a lifecycle operation these reads return the current
+snapshot. A one-shot `engine:status` with a `port` override waits for the
+operation to finish before probing that port. Model inventory sweeps also wait
+within their five-second budget before using status.
 
 To get a **NVPAIR-owned, stoppable** instance, start it on a port nothing is
 already serving — the probe misses, so the service spawns and owns the child

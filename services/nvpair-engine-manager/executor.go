@@ -55,12 +55,18 @@ type engineState struct {
 
 	// opMu serializes lifecycle operations (install / start / stop /
 	// restart / uninstall) for this engine, so concurrent calls can't
-	// double-spawn or interleave. Lock order is opMu → mu; the per-op
-	// st.mu is released around probes, and the background health loop
-	// never takes opMu.
+	// double-spawn or interleave. Passive status checks never take opMu.
+	// Lock order is opMu → mu; the background health loop only takes mu.
 	opMu sync.Mutex
 
-	mu         sync.Mutex
+	mu sync.Mutex
+	// revision changes at both ends of an operation and whenever a passive
+	// observation changes state. A probe may commit only against the revision
+	// it captured, so a Start/Stop/SetPort cannot be undone by old I/O.
+	revision   uint64
+	opActive   bool
+	opDone     chan struct{}
+	statusRuns map[statusProbeKey]*statusProbeRun
 	installed  bool
 	running    bool
 	healthy    bool
@@ -73,6 +79,27 @@ type engineState struct {
 	healthStop context.CancelFunc
 	// startCancel lets StopAll unblock doStart before waiting on opMu.
 	startCancel context.CancelFunc
+}
+
+// lockOperation marks the entire serialized operation, including its external
+// I/O, as a state transition before any lifecycle fields can change.
+func (st *engineState) lockOperation() {
+	st.opMu.Lock()
+	st.mu.Lock()
+	st.opActive = true
+	st.opDone = make(chan struct{})
+	st.revision++
+	st.mu.Unlock()
+}
+
+func (st *engineState) unlockOperation() {
+	st.mu.Lock()
+	st.opActive = false
+	st.revision++
+	close(st.opDone)
+	st.opDone = nil
+	st.mu.Unlock()
+	st.opMu.Unlock()
 }
 
 // Executor owns engine lifecycle for every engine known on this host.
